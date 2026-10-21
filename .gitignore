@@ -1,0 +1,8 @@
+# Build artefacts
+build/
+
+# macOS
+.DS_Store
+
+# Doc interne (non versionnée)
+SKILL-macos-window-gestures.md
