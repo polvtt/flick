@@ -179,80 +179,25 @@ enum Snap {
         }
         return r.insetBy(dx: g, dy: g)
     }
-}
 
-// MARK: - Overlay de prévisualisation (rectangle translucide animé)
-
-/// La fenêtre overlay EST le rectangle : on la déplace/redimensionne directement
-/// sur la zone cible. Animée via NSAnimationContext (piloté par un timer d'anim,
-/// donc le rendu est poussé à l'écran même quand la maj vient d'un event-tap).
-final class PreviewOverlay {
-    private let window: NSWindow
-    private var visible = false
-
-    init() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 10, height: 10),
-                          styleMask: .borderless, backing: .buffered, defer: false)
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.level = .floating
-        window.ignoresMouseEvents = true
-        window.hasShadow = false
-        window.isReleasedWhenClosed = false
-        window.alphaValue = 0
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary,
-                                     .ignoresCycle, .fullScreenAuxiliary]
-        // Le contentView dessine via SON PROPRE layer de backing (toujours rendu,
-        // contrairement à une sous-couche ajoutée à une vue layer-backed).
-        let v = NSView()
-        v.wantsLayer = true
-        if let l = v.layer {
-            l.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.25).cgColor
-            l.borderColor = NSColor.systemBlue.cgColor
-            l.borderWidth = 3
-            l.cornerRadius = 10
+    /// Origine corrigée quand l'app impose sa propre taille (ratio/taille fixes,
+    /// ex. FaceTime) : on ancre la fenêtre sur le bon coin/bord de la zone, en la
+    /// gardant dans la zone visible (sous la barre de menus, à l'écran).
+    func anchoredOrigin(forSize s: CGSize, in zone: CGRect, within vf: CGRect) -> CGPoint {
+        var x: CGFloat, y: CGFloat
+        switch self {
+        case .right, .topRight, .bottomRight: x = zone.maxX - s.width       // bord droit
+        case .center:                         x = zone.midX - s.width / 2    // centré
+        default:                              x = zone.minX                  // bord gauche
         }
-        window.contentView = v
-    }
-
-    private func cocoaRect(fromAX axRect: CGRect) -> CGRect {
-        let primaryH = NSScreen.screens.first?.frame.height ?? 0
-        return CGRect(x: axRect.minX, y: primaryH - axRect.maxY,
-                      width: axRect.width, height: axRect.height)
-    }
-
-    /// Conservé pour compat (le positionnement se fait dans update).
-    func position(onScreenContaining axPoint: CGPoint) {}
-
-    /// Montre/déplace la fenêtre-rectangle vers une cible en coords AX (haut-gauche).
-    func update(toAXRect axRect: CGRect) {
-        let r = cocoaRect(fromAX: axRect)
-        dbg("overlay.update -> cocoa=\(r) visibleAvant=\(visible)")
-        if !visible {
-            visible = true
-            window.setFrame(r, display: true)
-            window.orderFrontRegardless()
-            window.alphaValue = 0
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.12
-                window.animator().alphaValue = 1
-            }
-        } else {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.13
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                window.animator().setFrame(r, display: true)
-            }
+        switch self {
+        case .bottomLeft, .bottomRight: y = zone.maxY - s.height            // bas
+        case .center:                   y = zone.midY - s.height / 2         // centré
+        default:                        y = zone.minY                        // haut
         }
-    }
-
-    func hide() {
-        guard visible else { return }
-        visible = false
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.12
-            window.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in self?.window.orderOut(nil) })
+        x = min(max(x, vf.minX), max(vf.minX, vf.maxX - s.width))
+        y = min(max(y, vf.minY), max(vf.minY, vf.maxY - s.height))
+        return CGPoint(x: x, y: y)
     }
 }
 
@@ -269,10 +214,10 @@ final class GestureEngine {
     private var optMode = false             // Option maintenu → minimiser (bas) / quitter (Cmd+bas)
     private var candidateRect: CGRect?      // cible actuellement prévisualisée (coords AX)
     private var candidateKey: String?       // clé de zone/écran, pour n'animer qu'au changement
-    private var overlay: PreviewOverlay?
+    private var candidateSnap: Snap?        // secteur de snap courant (pour ré-ancrer si l'app clampe)
+    private var originalFrame: CGRect?      // cadre d'origine, pour restaurer si annulation
 
     func start() {
-        overlay = PreviewOverlay()
         let mask = (1 << CGEventType.scrollWheel.rawValue)
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -329,8 +274,7 @@ final class GestureEngine {
             return Unmanaged.passUnretained(event)
         case 4, 8: // ended / cancelled
             if capturing {
-                if phase == 4 { commit() }
-                overlay?.hide()
+                if phase == 4 { commit() } else { revertLive() }   // annulation → restaurer
                 reset()
                 return nil
             }
@@ -343,6 +287,11 @@ final class GestureEngine {
     private func beginIfEligible(at loc: CGPoint, modifiers: CGEventFlags) {
         guard let w = windowUnderCursor(loc), let f = frame(of: w) else {
             dbg("began @\(Int(loc.x)),\(Int(loc.y)) : pas de fenêtre exploitable sous le curseur")
+            return
+        }
+        // App exclue par l'utilisateur : Flick n'y touche pas (snap, écran, action).
+        if Exclusions.contains(appBundleID(of: w)) {
+            dbg("app exclue sous le curseur — ignorée")
             return
         }
         let inTitleBar = loc.y >= f.minY && loc.y <= f.minY + Config.titleBarBand
@@ -359,8 +308,9 @@ final class GestureEngine {
         if inTitleBar || withModifier || anywhere || cmd || opt {
             capturing = true
             target = w
+            originalFrame = f           // pour restaurer si le geste est annulé
             accumX = 0; accumY = 0
-            candidateRect = nil; candidateKey = nil
+            candidateRect = nil; candidateKey = nil; candidateSnap = nil
             cmdMode = cmd
             optMode = opt
             vf = axVisibleFrame(forGlobalPoint: CGPoint(x: f.midX, y: f.minY + 1))
@@ -386,16 +336,29 @@ final class GestureEngine {
         }
     }
 
-    /// Affiche/déplace l'aperçu, en n'animant QUE si la cible change (anti-saccades).
-    private func showPreview(key: String, rect: CGRect) {
-        guard key != candidateKey else { return }
-        candidateKey = key; candidateRect = rect
-        overlay?.update(toAXRect: rect)
+    /// Aperçu RÉEL : applique la cible directement à la fenêtre (donc taille exacte),
+    /// uniquement quand la zone change, pour rester fluide.
+    private func applyLive(key: String, snap: Snap?, zone: CGRect) {
+        guard key != candidateKey, let w = target else { return }
+        candidateKey = key; candidateRect = zone; candidateSnap = snap
+        setFrame(w, zone)
+        // Ré-ancrage si l'app impose sa taille (ratio/taille fixes, ex. FaceTime).
+        if let snap = snap, let actual = frame(of: w),
+           abs(actual.width - zone.width) > 2 || abs(actual.height - zone.height) > 2 {
+            var o = snap.anchoredOrigin(forSize: actual.size, in: zone, within: vf)
+            if let pv = AXValueCreate(.cgPoint, &o) {
+                AXUIElementSetAttributeValue(w, kAXPositionAttribute as CFString, pv)
+            }
+        }
     }
-    private func clearPreview() {
-        guard candidateKey != nil else { return }
-        candidateKey = nil; candidateRect = nil
-        overlay?.hide()
+
+    /// Restaure la fenêtre à son cadre d'origine (geste annulé / trop court).
+    private func revertLive() {
+        guard candidateKey != nil, let w = target, let orig = originalFrame else {
+            candidateKey = nil; candidateRect = nil; candidateSnap = nil; return
+        }
+        setFrame(w, orig)
+        candidateKey = nil; candidateRect = nil; candidateSnap = nil
     }
 
     /// Met à jour l'aperçu pendant le geste.
@@ -405,25 +368,25 @@ final class GestureEngine {
         let ax = abs(fx), ay = abs(fy)
 
         if optMode {
-            // Geste d'action (minimiser/quitter) : pas d'aperçu de zone.
-            clearPreview(); return
+            // Geste d'action (minimiser/quitter) : aucun aperçu, on ne bouge rien.
+            return
         }
         if cmdMode {
             // Déplacement vers l'écran adjacent dans la direction du geste.
-            guard max(ax, ay) >= Config.minTravel, let w = target, let wf = frame(of: w) else {
-                clearPreview(); return
+            guard max(ax, ay) >= Config.minTravel, let orig = originalFrame else {
+                revertLive(); return
             }
             let dir: (CGFloat, CGFloat) = ax > ay ? (fx >= 0 ? (1, 0) : (-1, 0))
                                                   : (fy >= 0 ? (0, 1) : (0, -1))
-            guard let dst = adjacentScreenFrame(from: wf, dir: dir) else {
-                clearPreview(); return     // pas d'écran de ce côté
+            guard let dst = adjacentScreenFrame(from: orig, dir: dir) else {
+                revertLive(); return     // pas d'écran de ce côté
             }
-            let src = axVisibleFrames().first { $0.contains(CGPoint(x: wf.midX, y: wf.midY)) } ?? vf
-            showPreview(key: "scr\(dir.0),\(dir.1)", rect: mappedRect(wf, from: src, to: dst))
+            let src = axVisibleFrames().first { $0.contains(CGPoint(x: orig.midX, y: orig.midY)) } ?? vf
+            applyLive(key: "scr\(dir.0),\(dir.1)", snap: nil, zone: mappedRect(orig, from: src, to: dst))
         } else if let snap = classify(fx, fy) {
-            showPreview(key: "snap\(snap)", rect: snap.rect(in: vf))
+            applyLive(key: "snap\(snap)", snap: snap, zone: snap.rect(in: vf))
         } else {
-            clearPreview()
+            revertLive()
         }
     }
 
@@ -447,13 +410,12 @@ final class GestureEngine {
             return
         }
 
-        guard let rect = candidateRect else { return }
-        dbg("commit cmd=\(cmdMode) -> \(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))x\(Int(rect.height))")
-        setFrame(w, rect)
-        if Config.moveCursorAfterAction {
-            // Recentrer le pointeur sur la barre de titre de la position RÉELLE
-            // (l'app a pu clamper le cadre). Coords globales = coords AX (haut-gauche).
-            let final = frame(of: w) ?? rect
+        // La fenêtre est déjà placée en direct pendant le geste : rien à redimensionner.
+        // Si aucune cible valide n'a été atteinte, elle est déjà revenue à l'origine.
+        guard candidateRect != nil else { return }
+        dbg("commit cmd=\(cmdMode) : conservé")
+        if Config.moveCursorAfterAction, let final = frame(of: w) {
+            // Recentrer le pointeur sur la barre de titre (position réelle).
             let p = CGPoint(x: final.midX, y: final.minY + min(Config.titleBarBand / 2, 11))
             CGWarpMouseCursorPosition(p)
             CGAssociateMouseAndMouseCursorPosition(1)   // réassocie le déplacement physique
@@ -466,18 +428,55 @@ final class GestureEngine {
         target = nil
         cmdMode = false
         optMode = false
-        candidateRect = nil; candidateKey = nil
+        candidateRect = nil; candidateKey = nil; candidateSnap = nil
         accumX = 0; accumY = 0
     }
 }
 
+// MARK: - Applications exclues (persistées dans les préférences)
+
+enum Exclusions {
+    private static let key = "excludedBundleIDs"
+    static func all() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: key) ?? []) }
+    static func contains(_ id: String?) -> Bool {
+        guard let id = id else { return false }
+        return all().contains(id)
+    }
+    static func toggle(_ id: String) {
+        var s = all()
+        if s.contains(id) { s.remove(id) } else { s.insert(id) }
+        UserDefaults.standard.set(Array(s), forKey: key)
+    }
+}
+
+/// Bundle ID de l'app propriétaire d'une fenêtre AX.
+func appBundleID(of w: AXUIElement) -> String? {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(w, &pid) == .success else { return nil }
+    return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+}
+
+/// PID des apps ayant au moins une fenêtre à l'écran (inclut les apps agents
+/// avec overlay, ex. une app d'encoche).
+func pidsWithOnScreenWindows() -> Set<pid_t> {
+    var pids = Set<pid_t>()
+    if let infos = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+        for w in infos {
+            if let pid = w[kCGWindowOwnerPID as String] as? pid_t { pids.insert(pid) }
+        }
+    }
+    return pids
+}
+
 // MARK: - App (agent barre de menus)
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let engine = GestureEngine()
     var statusItem: NSStatusItem!
 
     var statusLabel: NSMenuItem!
+    var exclusionsMenu: NSMenu!
     var pollTimer: Timer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -486,6 +485,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         statusLabel = NSMenuItem(title: "Flick — démarrage…", action: nil, keyEquivalent: "")
         menu.addItem(statusLabel)
+        menu.addItem(.separator())
+        // Sous-menu des applications exclues (reconstruit à chaque ouverture).
+        let exclItem = NSMenuItem(title: "Applications exclues", action: nil, keyEquivalent: "")
+        exclusionsMenu = NSMenu()
+        exclusionsMenu.delegate = self
+        exclItem.submenu = exclusionsMenu
+        menu.addItem(exclItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quitter", action: #selector(quit), keyEquivalent: "q")
         statusItem.menu = menu
@@ -512,6 +518,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLabel.title = "Flick — actif"
         dbg("autorisé : démarrage du moteur de gestes")
         engine.start()
+    }
+
+    /// Reconstruit la liste des apps à l'ouverture du sous-menu.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === exclusionsMenu else { return }
+        menu.removeAllItems()
+        let excluded = Exclusions.all()
+        let hint = NSMenuItem(title: "Coche une app pour que Flick l'ignore", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
+        menu.addItem(.separator())
+
+        var seen = Set<String>()
+        let windowPids = pidsWithOnScreenWindows()
+        let selfID = Bundle.main.bundleIdentifier
+        let running = NSWorkspace.shared.runningApplications
+            .filter { a in
+                guard let id = a.bundleIdentifier, id != selfID else { return false }
+                // Apps classiques (icône Dock) + agents ayant une fenêtre à l'écran (ex. Encoche).
+                if a.activationPolicy == .regular { return true }
+                if a.activationPolicy == .accessory { return windowPids.contains(a.processIdentifier) }
+                return false
+            }
+            .sorted { ($0.localizedName ?? "").localizedCaseInsensitiveCompare($1.localizedName ?? "") == .orderedAscending }
+        for a in running {
+            guard let id = a.bundleIdentifier else { continue }
+            seen.insert(id)
+            let it = NSMenuItem(title: a.localizedName ?? id,
+                                action: #selector(toggleExclusion(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = id
+            it.state = excluded.contains(id) ? .on : .off
+            menu.addItem(it)
+        }
+        // Apps exclues mais non lancées : pour pouvoir les retirer quand même.
+        let offline = excluded.subtracting(seen).sorted()
+        if !offline.isEmpty {
+            menu.addItem(.separator())
+            for id in offline {
+                let it = NSMenuItem(title: "\(id) — non lancée",
+                                    action: #selector(toggleExclusion(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = id
+                it.state = .on
+                menu.addItem(it)
+            }
+        }
+    }
+
+    @objc func toggleExclusion(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        Exclusions.toggle(id)
     }
 
     @objc func quit() { NSApp.terminate(nil) }
