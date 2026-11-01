@@ -8,6 +8,7 @@
 
 import AppKit
 import ApplicationServices
+import ServiceManagement
 
 // MARK: - Log de diagnostic (activé si FLICK_DEBUG=1)
 
@@ -477,6 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var statusLabel: NSMenuItem!
     var exclusionsMenu: NSMenu!
+    var loginItem: NSMenuItem!
     var pollTimer: Timer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -493,7 +495,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         exclItem.submenu = exclusionsMenu
         menu.addItem(exclItem)
         menu.addItem(.separator())
+        loginItem = NSMenuItem(title: "Lancer à l'ouverture de session",
+                               action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem.target = self
+        menu.addItem(loginItem)
+        menu.addItem(.separator())
         menu.addItem(withTitle: "Quitter", action: #selector(quit), keyEquivalent: "q")
+        menu.delegate = self            // pour rafraîchir l'état « lancer au login » à l'ouverture
         statusItem.menu = menu
 
         // Demande l'autorisation (affiche le prompt la 1re fois).
@@ -520,8 +528,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         engine.start()
     }
 
-    /// Reconstruit la liste des apps à l'ouverture du sous-menu.
+    /// Rafraîchit l'état « lancer au login » à l'ouverture du menu principal.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === statusItem.menu {
+            if #available(macOS 13, *) {
+                loginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+                loginItem.isEnabled = true
+            } else {
+                loginItem.isEnabled = false
+            }
+            return
+        }
         guard menu === exclusionsMenu else { return }
         menu.removeAllItems()
         let excluded = Exclusions.all()
@@ -570,6 +587,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleExclusion(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         Exclusions.toggle(id)
+    }
+
+    @objc func toggleLogin() {
+        guard #available(macOS 13, *) else { return }
+        let svc = SMAppService.mainApp
+        do {
+            if svc.status == .enabled { try svc.unregister() } else { try svc.register() }
+        } catch {
+            dbg("toggle login échec : \(error)")
+        }
     }
 
     @objc func quit() { NSApp.terminate(nil) }
